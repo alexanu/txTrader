@@ -13,7 +13,7 @@
 
 
 import time
-from twisted.internet import reactor, protocol, task
+from twisted.internet import reactor, protocol, task, error
 from twisted.protocols.basic import NetstringReceiver
 
 class Monitor(object):
@@ -29,6 +29,7 @@ class Monitor(object):
         self.port = port
         self.user = user
         self.password = password
+        self.shutdown_pending = False
         self.channel = ''
         self.callback_types = ['status', 'error', 'time', 'order', 'execution', 'quote', 'trade', 'tick', 'shutdown']
         self.flags = 'noquotes notrades'
@@ -45,6 +46,7 @@ class Monitor(object):
 
     def shutdown_event(self):
         self._callback('shutdown', 'reactor shutdown detected')
+        self.shutdown_pending = True
         if self.connection: 
             self.connection.disconnect()
 
@@ -69,9 +71,10 @@ class Monitor(object):
             delete(self.callbacks[cb_type])
 
     def _callback(self, cb_type, cb_data):
-        if cb_type in self.callbacks.keys():
-            if not self.callbacks[cb_type](cb_type, cb_data):
-                reactor.callFromThread(reactor.stop)
+        if not self.shutdown_pending: 
+            if cb_type in self.callbacks.keys():
+                if not self.callbacks[cb_type](cb_type, cb_data):
+                    reactor.callFromThread(reactor.stop)
 
     def _cb_print(self, label, msg):
         print('%s: %s' % (label, repr(msg)))
@@ -107,6 +110,7 @@ class StatusClient(NetstringReceiver):
                     '%s.time: ' % self.channel: 'time',
                     '%s.error:' % self.channel: 'error',
                     '%s.order.' % self.channel: 'order',
+                    '%s.ticket.' % self.channel: 'ticket',
                     '%s.open-order.' % self.channel: 'order',
                     '%s.execution.' % self.channel: 'execution',
                     '%s.quote.' % self.channel: 'quote',
@@ -136,12 +140,18 @@ class StatusClientFactory(protocol.ClientFactory):
     def clientConnectionFailed(self, connector, reason):
         self.rx._callback('error', 'connection %s failed, reason=%s' % (connector, reason))
         if reactor.running:
-            reactor.stop()
+            try: 
+                reactor.stop()
+            except error.ReactorNotRunning:
+		pass
 
     def clientConnectionLost(self, connector, reason):
         self.rx._callback('error', 'connection %s lost, reason=%s' % (connector, reason))
         if reactor.running:
-            reactor.stop()
+            try:
+                reactor.stop()
+            except error.ReactorNotRunning:
+		pass
 
 
 if __name__ == '__main__':

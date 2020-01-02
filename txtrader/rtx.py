@@ -20,13 +20,14 @@ from hexdump import hexdump
 import pytz
 import tzlocal
 import datetime
+import re
 from pprint import pprint
 
 from txtrader.config import Config
 
 CALLBACK_METRIC_HISTORY_LIMIT = 1024
 
-TIMEOUT_TYPES = ['DEFAULT', 'ACCOUNT', 'ADDSYMBOL', 'ORDER', 'ORDERSTATUS', 'POSITION', 'TIMER']
+TIMEOUT_TYPES = ['DEFAULT', 'ACCOUNT', 'ADDSYMBOL', 'ORDER', 'ORDERSTATUS', 'POSITION', 'TIMER', 'BARCHART']
 
 # default RealTick orders to NYSE and Stock type
 RTX_EXCHANGE='NYS'
@@ -38,6 +39,9 @@ ENABLE_CXN_DEBUG = False
 
 DISCONNECT_SECONDS = 30 
 SHUTDOWN_ON_DISCONNECT = True 
+
+BARCHART_FIELDS = 'DISP_NAME,TRD_DATE,TRDTIM_1,OPEN_PRC,HIGH_1,LOW_1,SETTLE,ACVOL_1'
+BARCHART_TOPIC = 'LIVEQUOTE'
 
 from twisted.python import log
 from twisted.python.failure import Failure
@@ -91,6 +95,7 @@ class RtxClientFactory(ReconnectingClientFactory):
 class API_Symbol(object):
     def __init__(self, api, symbol, client_id, init_callback):
         self.api = api
+        self.api.symbols[symbol]=self
         self.id = str(uuid1())
         self.output = api.output
         self.clients = set([client_id])
@@ -104,19 +109,27 @@ class API_Symbol(object):
         self.last = 0.0
         self.size = 0
         self.volume = 0
+        self.open = 0.0
         self.close = 0.0
         self.vwap = 0.0
         self.high = 0.0
         self.low = 0.0
-        self.rawdata = ''
-        self.api.symbols[symbol] = self
+        self.minute_high = 0.0
+        self.minute_low = 0.0
+        self.last_trade_time = '00:00:00'
+        self.last_trade_minute = -1
+        self.last_api_minute = -1
+
+        self.rawdata = {} 
         self.last_quote = ''
-        self.output('API_Symbol %s %s created for client %s' %
-                    (self, symbol, client_id))
-        self.output('Adding %s to watchlist' % self.symbol)
-        self.cxn = api.cxn_get('TA_SRV', 'LIVEQUOTE')
-        cb = API_Callback(self.api, self.cxn.id, 'init_symbol', RTX_LocalCallback(self.api, self.init_handler), self.api.callback_timeout['ADDSYMBOL'])
-        self.cxn.request('LIVEQUOTE', '*', "DISP_NAME='%s'" % symbol, cb)
+        self.output('API_Symbol %s %s created for client %s' % (self, symbol, client_id))
+        self.barchart = {}
+
+        # request initial symbol data
+        self.cxn_updates = None
+        self.cxn_init = api.cxn_get('TA_SRV', 'LIVEQUOTE')
+        cb = API_Callback(self.api, self.cxn_init.id, 'init_symbol', RTX_LocalCallback(self.api, self.init_handler, self.init_failed), self.api.callback_timeout['ADDSYMBOL'])
+        self.cxn_init.request('LIVEQUOTE', '*', "DISP_NAME='%s'" % symbol, cb)
 
     def __str__(self):
         return 'API_Symbol(%s bid=%s bidsize=%d ask=%s asksize=%d last=%s size=%d volume=%d close=%s vwap=%s clients=%s' % (self.symbol, self.bid, self.bid_size, self.ask, self.ask_size, self.last, self.size, self.volume, self.close, self.vwap, self.clients)
@@ -128,11 +141,13 @@ class API_Symbol(object):
         ret = {
             'symbol': self.symbol,
             'last': self.last,
+            'tradetime': self.last_trade_time,
             'size': self.size,
             'volume': self.volume,
+            'open': self.open,
             'close': self.close,
             'vwap': self.vwap,
-            'fullname': self.fullname
+            'fullname': self.fullname,
         }
         if self.api.enable_high_low: 
           ret['high'] = self.high
@@ -142,6 +157,8 @@ class API_Symbol(object):
           ret['bidsize'] = self.bid_size
           ret['ask'] = self.ask
           ret['asksize'] = self.ask_size
+        #if self.api.enable_barchart:
+        #  ret['bars'] = self.barchart_render()
         return ret
 
     def add_client(self, client):
@@ -155,7 +172,14 @@ class API_Symbol(object):
         self.clients.discard(client)
         if not self.clients:
             self.output('Removing %s from watchlist' % self.symbol)
-            # TODO: stop live updates of market data from RTX
+            if self.cxn_updates:
+                service, topic, table, what, where = self.quotes_advise_fields()
+                cb = API_Callback(self.api, self.cxn_updates.id, 'unadvise', RTX_LocalCallback(self.api, self.cancel_quotes_advise))
+                self.cxn_updates.unadvise(table, what, where, cb)
+                self.cxn_updates = None
+
+    def cancel_quotes_advise(self, data):
+        self.output('quotes_advise terminated: %s' % repr(data))
 
     def update_quote(self):
         quote = 'quote.%s:%s %d %s %d' % (
@@ -170,21 +194,52 @@ class API_Symbol(object):
 
     def init_handler(self, data):
         data = json.loads(data)
-        self.output('API_Symbol init: %s' % data)
         self.parse_fields(None, data[0])
         self.rawdata = data[0]
         for k,v in self.rawdata.items():
-            if v.startswith('Error '):
+            if str(v).startswith('Error '):
                 self.rawdata[k]=''
-        if self.api.symbol_init(self):
-            self.cxn = self.api.cxn_get('TA_SRV', 'LIVEQUOTE')
-            fields = 'TRDPRC_1,TRDVOL_1,ACVOL_1'
-            if self.api.enable_ticker:
-                fields += ',BID,BIDSIZE,ASK,ASKSIZE'
-            if self.api.enable_high_low:
-                fields += ',HIGH_1,LOW_1'
-            self.cxn.advise('LIVEQUOTE', fields, "DISP_NAME='%s'" % self.symbol, self.parse_fields)
+        self.cxn_init = None
+  
+        # if this is a valid symbol
+        if self.api.enable_barchart:
+ 	    self.barchart_query('.', self.complete_barchart_init, self.barchart_init_failed)
+        elif self.api.symbol_init(self):
+            self.complete_symbol_init()
 
+    def init_failed(self, error):
+        self.api.error_handler(repr(self), 'ERROR: Initial query failed for symbol %s', self.symbol)
+
+    def barchart_query(self, start, callback, errback):
+        self.api.query_bars(self.symbol, 1, start, '.', RTX_LocalCallback(self.api, callback, errback))
+        
+    def barchart_init_failed(self, error):
+        self.api.error_handler(repr(self), 'ERROR: Initial BARCHART query failed for symbol %s', self.symbol)
+
+    def complete_barchart_init(self, bars):
+        self.barchart_update(bars)
+        if self.api.symbol_init(self):
+            self.complete_symbol_init()
+
+    def complete_symbol_init(self):
+        # enable live price updates 
+        self.output('Adding %s to watchlist' % self.symbol)
+        service, topic, table, what, where = self.quotes_advise_fields()
+        self.cxn_updates = self.api.cxn_get(service, topic)
+        self.cxn_updates.advise(table, what, where, self.parse_fields)
+
+    def quotes_advise_fields(self):
+        service = 'TA_SRV'
+        topic = 'LIVEQUOTE'
+        table = 'LIVEQUOTE'
+        what = 'TRD_DATE,TRDTIM_1,TRDPRC_1,TRDVOL_1,ACVOL_1,OPEN_PRC,HST_CLOSE,VWAP'
+        if self.api.enable_ticker:
+            what += ',BID,BIDSIZE,ASK,ASKSIZE'
+        if self.api.enable_high_low:
+            what += ',HIGH_1,LOW_1'
+        where = "DISP_NAME='%s'" % self.symbol
+        return (service, topic, table, what, where)
+        
     def parse_fields(self, cxn, data):
         trade_flag = False
         quote_flag = False
@@ -197,6 +252,16 @@ class API_Symbol(object):
         if 'TRDPRC_1' in data.keys():
             self.last = self.api.parse_tql_float(data['TRDPRC_1'], pid, 'TRDPRC_1')
             trade_flag = True
+            if 'TRDTIM_1' in data.keys() and 'TRD_DATE' in data.keys():
+                self.last_trade_time = ' '.join(self.api.format_barchart_date(data['TRD_DATE'], data['TRDTIM_1']))
+            else:
+                self.api.error_handler(repr(self), 'ERROR: TRDPRC_1 without TRD_DATE, TRDTIM_1')
+           
+            # don't request an update during the symbol init processing
+            if self.api.enable_barchart and (not self.cxn_init):
+                # query a barchart update after each trade
+ 	        self.barchart_query('-5', self.barchart_update)
+
         if 'HIGH_1' in data.keys():
             self.high = self.api.parse_tql_float(data['HIGH_1'], pid, 'HIGH_1')
             trade_flag = True
@@ -225,6 +290,8 @@ class API_Symbol(object):
             quote_flag = True
         if 'COMPANY_NAME' in data.keys():
             self.fullname = self.api.parse_tql_str(data['COMPANY_NAME'], pid, 'COMPANY_NAME')
+        if 'OPEN_PRC' in data.keys():
+            self.open = self.api.parse_tql_float(data['OPEN_PRC'], pid, 'OPEN_PRC')
         if 'HST_CLOSE' in data.keys():
             self.close = self.api.parse_tql_float(data['HST_CLOSE'], pid, 'HST_CLOSE')
         if 'VWAP' in data.keys():
@@ -236,18 +303,38 @@ class API_Symbol(object):
             if trade_flag:
                 self.update_trade()
 
-    #def update_handler(self, data):
-    #    self.output('API_Symbol update: %s' % data)
-    #    self.rawdata = data
+    def barchart_render(self):
+        return [key.split(' ') + self.barchart[key] for key in sorted(self.barchart.keys())]
+
+    def barchart_update(self, bars):
+        for bar in json.loads(bars):
+            print('===barchart_update %s' % (repr(bar)))
+            self.barchart['%s %s' % (bar[0], bar[1])] = bar[2:]        
+
 
 class API_Order(object):
-    def __init__(self, api, oid, data, callback=None):
+    def __init__(self, api, oid, data, origin, callback=None):
+        #pprint({'new API_Order id=%s origin=%s' % (oid, origin): data})
         self.api = api
         self.oid = oid
-        self.fields = data
         self.callback = callback
         self.updates = []
         self.suborders = {}
+        self.fields = {}
+        self.identified = False
+        self.ticket = 'undefined'
+        data['status'] = 'Initialized'
+        data['origin'] = origin
+        self.update(data, init=True)
+
+    def identify_order_type(self, data):
+        if not self.identified:
+            if 'TYPE' in data:
+                otype = data['TYPE']
+                # set ticket flag based on first TYPE encountered
+                self.ticket = 'ticket' if otype.startswith('UserSubmitStaged') else 'order'
+                self.fields['type'] = otype
+                self.identified = True
 
     def initial_update(self, data):
         self.update(data)
@@ -255,9 +342,11 @@ class API_Order(object):
             self.callback.complete(self.render())
             self.callback = None
 
-    def update(self, data):
+    def update(self, data, init=False):
 
         field_state = json.dumps(self.fields)
+
+        self.identify_order_type(data)
     
         if 'ORDER_ID' in data:
             order_id = data['ORDER_ID']
@@ -270,9 +359,13 @@ class API_Order(object):
                 change = 'new'
             self.suborders[order_id] = data
         else:
-            self.api.error_handler(self.oid, 'Order Update without ORDER_ID: %s' % repr(data))
-            order_id = 'unknown'
-            change = 'error'
+            if init:
+                order_id = '(init)'
+                change = 'new'
+            else:
+                self.api.error_handler(self.oid, 'Order Update without ORDER_ID: %s' % repr(data))
+                order_id = 'unknown'
+                change = 'error'
 
         if self.api.log_order_updates:
             self.api.output('ORDER_UPDATE: OID=%s ORDER_ID=%s %s' % (self.oid, order_id, change))
@@ -290,13 +383,13 @@ class API_Order(object):
             if changes:
                 if self.api.log_order_updates:
                     self.api.output('ORDER_CHANGES: OID=%s ORDER_ID=%s %s' % (self.oid, order_id, repr(changes)))
-                if order_id != self.oid:
-                    update_type = changes['TYPE'] if 'TYPE' in changes else 'Undefined'
-                    self.updates.append({'id': order_id, 'type':  update_type, 'fields': changes, 'time': time.time() })
+                #if order_id != self.oid:
+                update_type = data['TYPE'] if 'TYPE' in data else 'Undefined'
+                self.updates.append({'id': order_id, 'type':  update_type, 'fields': changes, 'time': time.time() })
 
-        if json.dumps(self.fields) != field_state:
-            self.api.send_order_status(self)
-
+        if not init:
+            if json.dumps(self.fields) != field_state:
+                self.api.send_order_status(self)
 
     def update_fill_fields(self):
         if self.fields['TYPE'] in ['UserSubmitOrder', 'ExchangeTradeOrder']:
@@ -309,9 +402,13 @@ class API_Order(object):
 
     def render(self):
         # customize fields for standard txTrader order status 
-        self.fields['permid']=self.fields['ORIGINAL_ORDER_ID']
+        if 'ORIGINAL_ORDER_ID' in self.fields:
+            self.fields['permid']=self.fields['ORIGINAL_ORDER_ID']
         self.fields['symbol']=self.fields['DISP_NAME']
         self.fields['account']=self.api.make_account(self.fields)
+        self.fields['quantity']=self.fields['VOLUME']
+        self.fields['class'] = self.ticket
+
         status = self.fields.setdefault('CURRENT_STATUS', 'UNDEFINED')
         otype = self.fields.setdefault('TYPE', 'Undefined')
         #print('render: permid=%s ORDER_ID=%s CURRENT_STATUS=%s TYPE=%s' % (self.fields['permid'], self.fields['ORDER_ID'], status, otype))
@@ -331,7 +428,7 @@ class API_Order(object):
                 self.update_fill_fields()
             elif otype == 'UserSubmitCancel':
                 self.fields['status'] = 'Cancelled'
-            elif otype == 'UserSubmitChange':
+            elif otype in ['UserSubmitChange', 'AdjustQty']:
                 self.fields['status'] = 'Changed'
             elif otype == 'ExchangeAcceptOrder':
                 self.fields['status'] = 'Accepted'
@@ -351,8 +448,16 @@ class API_Order(object):
             self.fields['status'] = 'Error'
             
         self.fields['updates'] = self.updates
+        f = self.fields 
+        self.fields['text'] = '%s %d %s (%s)' % (f['BUYORSELL'], int(f['quantity']), f['symbol'], f['status'])
 
-        return self.fields
+        ret = {'raw':{}}
+        for k,v in self.fields.iteritems():
+            if k.islower():
+                ret[k]=v
+            else:
+                ret['raw'][k]=v
+        return ret
 
     def is_filled(self):
         return bool(self.fields['CURRENT_STATUS']=='COMPLETED' and
@@ -377,7 +482,7 @@ class API_Order(object):
 class API_Callback(object):
     def __init__(self, api, id, label, callable, timeout=0):
         """callable is stored and used to return results later"""
-        #api.output('API_Callback.__init__() %s' % self)
+        #api.output('API_Callback.__init__%s' % repr((self, api, id, label, callable, timeout)))
         self.api = api
         self.id = id
         self.label = label
@@ -418,6 +523,8 @@ class API_Callback(object):
                 self.expired = True
                 self.done = True
 
+    # TODO: all of these format_* really belong in the api class
+
     def format_results(self, results):
         #print('format_results: label=%s results=%s' % (self.label, results))
         if self.label == 'account_data':
@@ -426,10 +533,14 @@ class API_Callback(object):
             results = self.format_positions(results)
         elif self.label == 'orders':
             results = self.format_orders(results)
+        elif self.label == 'tickets':
+            results = self.format_tickets(results)
         elif self.label=='executions':
             results = self.format_executions(results)
         elif self.label == 'order_status':
             results = self.format_orders(results, self.id)
+        elif self.label == 'barchart':
+            results = self.api.format_barchart(results)
 
         return json.dumps(results)
 
@@ -440,7 +551,7 @@ class API_Callback(object):
         return data
 
     def format_positions(self, rows):
-        # Positions should return {'ACOUNT': {'SYMBOL': QUANTITY, ...}, ...}
+        # Positions should return {'ACCOUNT': {'SYMBOL': QUANTITY, ...}, ...}
         positions = {}
         [positions.setdefault(a, {}) for a in self.api.accounts]
 	#print('format_positions: rows=%s' % repr(rows))
@@ -457,15 +568,25 @@ class API_Callback(object):
         return positions
 
     def format_orders(self, rows, oid=None):
+        return self._format_orders(rows, oid, 'order')
+
+    def format_tickets(self, rows, oid=None):
+        return self._format_orders(rows, oid, 'ticket')
+
+    def _format_orders(self, rows, oid, _filter):
+        #pprint({'format_orders': rows})
+        #print('_format_orders %s %s' % (oid, _filter))
         for row in rows or []:
             if row:
                 self.api.handle_order_response(row)
         if oid:
-            results = self.api.orders[oid].render()
+            results = self.api.orders[oid].render() if oid in self.api.orders else None
         else:
             results={}
             for k,v in self.api.orders.items():
-                results[k] = v.render()
+                # don't return staged order tickets
+                if v.ticket == _filter:
+                    results[k] = v.render()
         return results
 
     def format_executions(self, rows):
@@ -479,6 +600,7 @@ class API_Callback(object):
                 results[k]['updates']=v.updates
         return results
 
+
 class RTX_Connection(object):
     def __init__(self, api, service, topic, enable_logging=False):
         self.api = api
@@ -487,7 +609,7 @@ class RTX_Connection(object):
         self.topic = topic
         self.key = '%s;%s' % (service, topic)
         self.last_query = ''
-        self.api.output('Creating %s' % repr(self))
+        self.api.output('RTX_Connection init %s' % repr(self))
         self.api.cxn_register(self)
         self.api.gateway_send('connect %s %s' % (self.id, self.key))
         self.ack_pending = 'CONNECTION PENDING'
@@ -503,6 +625,9 @@ class RTX_Connection(object):
         self.connected = False
         self.on_connect_action = None
         self.update_ready()
+
+    def __del__(self):
+        self.api.output('RTX_Connection delete %s' % repr(self))
 
     def __repr__(self):
         return self.__str__()
@@ -579,9 +704,9 @@ class RTX_Connection(object):
                     self.connected = True
                     if self.on_connect_action:
                         self.ready = True
-                        cmd, arg, exa, cba, exr, cbr, exs, cbs, cbu, uhr = self.on_connect_action
+                        cmd, arg, exa, cba, cbr, exs, cbs, cbu, uhr = self.on_connect_action
                         self.api.output('%s sending on_connect_action: %s' % (repr(self), repr(self.on_connect_action)))
-                        self.send(cmd, arg, exa, cba, exr, cbr, exs, cbs, cbu, uhr)
+                        self.send(cmd, arg, exa, cba, cbr, exs, cbs, cbu, uhr)
                         self.on_connect_action = None
                         print('after on_connect_action send: self.status_pending=%s' % self.status_pending)
 
@@ -609,49 +734,51 @@ class RTX_Connection(object):
             else:
                 self.api.error_handler(self.id, 'Update Unexpected: %s' % repr(data))
 
-    def query(self, cmd, table, what, where, ex_ack=None, cb_ack=None, ex_response=None, cb_response=None, ex_status=None, cb_status=None, cb_update=None, update_handler=None):
+    def query(self, cmd, table, what, where, expect_ack=None, ack_callback=None, response_callback=None, expect_status=None, status_callback=None, update_callback=None, update_handler=None):
         tql='%s;%s;%s' % (table, what, where)
         self.last_query='%s: %s' % (cmd, tql)
-        ret = self.send(cmd, tql, ex_ack, cb_ack, ex_response, cb_response, ex_status, cb_status, cb_update, update_handler)
+        ret = self.send(cmd, tql, expect_ack, ack_callback, response_callback, expect_status, status_callback, update_callback, update_handler)
 
     def request(self, table, what, where, callback):
-        return self.query('request', table, what, where, 'REQUEST_OK', None, True, callback)
+        return self.query('request', table, what, where, expect_ack='REQUEST_OK', response_callback=callback)
 
     def advise(self, table, what, where, handler):
-        return self.query('advise', table, what, where, 'ADVISE_OK', None, None, None, 'OnOtherAck', None, None, handler)
+        return self.query('advise', table, what, where, expect_ack='ADVISE_OK', expect_status='OnOtherAck', update_handler=handler)
 
     def adviserequest(self, table, what, where, callback, handler):
-        return self.query('adviserequest', table, what, where, 'ADVISEREQUEST_OK', None, True, callback, 'OnOtherAck', None, None, handler)
+        return self.query('adviserequest', table, what, where, expect_ack='ADVISE_REQUEST_OK', response_callback=callback, expect_status='OnOtherAck', update_handler=handler)
 
     def unadvise(self, table, what, where, callback):
-        return self.query('unadvise', table, what, where, 'UNADVISE_OK', None, None, None, 'OnOtherAck', callback)
+        # force ready state so the unadvise command will be sent
+        self.ready = True
+        return self.query('unadvise', table, what, where, expect_ack='UNADVISE_OK', expect_status='OnOtherAck', status_callback=callback)
 
     def poke(self, table, what, where, data, ack_callback, callback):
         tql = '%s;%s;%s!%s' % (table, what, where, data)
         self.last_query = 'poke: %s' % tql
-        return self.send('poke', tql, "POKE_OK", ack_callback, None, None, 'OnOtherAck', callback)
+        return self.send('poke', tql, expect_ack="POKE_OK", ack_callback=ack_callback, expect_status='OnOtherAck', status_callback=callback)
 
     def execute(self, command, callback):
         self.last_query = 'execute: %s' % command
-        return self.send('execute', command, "EXECUTE_OK", callback)
+        return self.send('execute', command, expect_ack="EXECUTE_OK", ack_callback=callback)
 
     def terminate(self, code, callback):
         self.last_query = 'terminate: %s' % str(code) 
-        return self.send('terminate', str(code), "TERMINATE_OK", callback)
+        return self.send('terminate', str(code), expect_ack="TERMINATE_OK", ack_callback=callback)
 
-    def send(self, cmd, args, ex_ack=None, cb_ack=None, ex_response=None, cb_response=None, ex_status=None, cb_status=None, cb_update=None, update_handler=None):
+    def send(self, cmd, args, expect_ack=None, ack_callback=None, response_callback=None, expect_status=None, status_callback=None, update_callback=None, update_handler=None):
         if self.ready:
             self.cmd = cmd
             if 'request' in cmd:
                 self.response_rows = []
             ret = self.api.gateway_send('%s %s %s' % (cmd, self.id, args))
-            self.ack_pending = ex_ack
-            self.ack_callback = cb_ack
-            self.response_pending = ex_response
-            self.response_callback = cb_response
-            self.status_pending = ex_status
-            self.status_callback = cb_status
-            self.update_callback = cb_update
+            self.ack_pending = expect_ack
+            self.ack_callback = ack_callback
+            self.response_pending = bool(response_callback)
+            self.response_callback = response_callback
+            self.status_pending = expect_status
+            self.status_callback = status_callback
+            self.update_callback = update_callback
             self.update_handler = update_handler
         else:
             if self.on_connect_action:
@@ -659,7 +786,7 @@ class RTX_Connection(object):
                 ret = False
             else:
                 self.api.output('%s storing on_connect_action (%s)...' % (self, cmd))
-                self.on_connect_action = (cmd, args, ex_ack, cb_ack, ex_response, cb_response, ex_status, cb_status, cb_update, update_handler)
+                self.on_connect_action = (cmd, args, expect_ack, ack_callback, response_callback, expect_status, status_callback, update_callback, update_handler)
                 ret = True
         return ret
 
@@ -682,7 +809,6 @@ class RTX_LocalCallback(object):
         else:
             self.api.error_handler(repr(self), 'Failure: undefined errback_handler for Connection: %s error=%s' % (repr(self), repr(error)))
 
-
 class RTX(object):
     def __init__(self):
         self.label = 'RTX Gateway'
@@ -698,16 +824,20 @@ class RTX(object):
         self.tcp_port = int(self.config.get('TCP_PORT'))
         self.enable_ticker = bool(int(self.config.get('ENABLE_TICKER')))
         self.enable_high_low= bool(int(self.config.get('ENABLE_HIGH_LOW')))
+        self.enable_barchart = bool(int(self.config.get('ENABLE_BARCHART')))
         self.enable_seconds_tick = bool(int(self.config.get('ENABLE_SECONDS_TICK')))
         self.log_api_messages = bool(int(self.config.get('LOG_API_MESSAGES')))
         self.debug_api_messages = bool(int(self.config.get('DEBUG_API_MESSAGES')))
         self.log_client_messages = bool(int(self.config.get('LOG_CLIENT_MESSAGES')))
         self.log_order_updates = bool(int(self.config.get('LOG_ORDER_UPDATES')))
+        self.time_offset = int(self.config.get('TIME_OFFSET'))
         self.callback_timeout = {}
         for t in TIMEOUT_TYPES:
             self.callback_timeout[t] = int(self.config.get('TIMEOUT_%s' % t))
             self.output('callback_timeout[%s] = %d' % (t, self.callback_timeout[t]))
         self.now = None
+        self.feed_now = None
+        self.trade_minute = -1
         self.feedzone = pytz.timezone(self.config.get('API_TIMEZONE'))
         self.localzone = tzlocal.get_localzone()
         self.current_account = ''
@@ -742,6 +872,7 @@ class RTX(object):
         self.next_order_id = -1
         self.last_minute = -1
         self.symbols = {}
+        self.barchart = None
         self.primary_exchange_map = {}
         self.gateway_sender = None
         self.active_cxn = {}
@@ -754,6 +885,15 @@ class RTX(object):
         self.repeater = LoopingCall(self.EverySecond)
         self.repeater.start(1)
 
+    def flags(self):
+        return {
+          'TICKER': self.enable_ticker,
+          'HIGH_LOW': self.enable_high_low,
+          'BARCHART': self.enable_barchart,
+          'SECONDS_TICK': self.enable_seconds_tick,
+          'TIME_OFFSET': self.time_offset,
+        }
+
     def record_callback_metrics(self, label, elapsed, expired):
         m = self.callback_metrics.setdefault(label, {'tot':0, 'min': 9999, 'max': 0, 'avg': 0, 'exp': 0, 'hst': []})
         total = m['tot']  
@@ -765,7 +905,6 @@ class RTX(object):
         m['hst'].append(elapsed)
         if len(m['hst']) > CALLBACK_METRIC_HISTORY_LIMIT:
           del m['hst'][0]
-
         
     def cxn_register(self, cxn):
         if ENABLE_CXN_DEBUG:
@@ -813,7 +952,6 @@ class RTX(object):
             self.output('<-- %s' % repr(msg))
         if self.gateway_sender:
             self.gateway_sender('%s\n' % str(msg))
-
 
     def dump_input_message(self, msg):
         self.output('--RX[%d]-->' % (len(msg)))
@@ -945,7 +1083,7 @@ class RTX(object):
                 self.orders[oid].update(msg)
             else:
                 # we've never seen this order, so add it to the collection and update it
-                o = API_Order(self, oid, {})
+                o = API_Order(self, oid, msg, 'realtick')
                 self.orders[oid]=o
                 o.update(msg)
         else:
@@ -964,7 +1102,7 @@ class RTX(object):
 
     def send_order_status(self, order):
         fields = order.render()
-        self.WriteAllClients('order.%s %s %s %s' % (fields['permid'], fields['account'], fields['TYPE'], fields['status']))
+        self.WriteAllClients('%s.%s %s %s %s' % (order.ticket, fields['permid'], fields['account'], fields['raw']['TYPE'], fields['status']))
 
     def make_account(self, row):
         return '%s.%s.%s.%s' % (row['BANK'], row['BRANCH'], row['CUSTOMER'], row['DEPOSIT'])
@@ -1071,8 +1209,15 @@ class RTX(object):
         ret = self.parse_tql_field(data, pid, label)
         return str(ret) if ret else ''
 
+    def parse_tql_time(self, data, pid, label):
+        """Parse TQL ascii time field returning as number of seconds since midnight"""
+        field = self.parse_tql_field(data, pid, label)
+        hour, minute, second = [int(i) for i in field.split(':')[0:3]]
+        ret = hour * 3600 + minute * 60 + second
+        return int(ret) if ret else 0
+
     def parse_tql_field(self, data, pid, label):
-        if data.lower().startswith('error '):
+        if str(data).lower().startswith('error '):
             if data.lower()=='error 0':
                 code = 'Field Not Found'
             elif data.lower() == 'error 2':
@@ -1100,17 +1245,27 @@ class RTX(object):
                 # this indicates the $TIME symbol is not found on the server, which is a kludge to determine the login has failed
                 self.force_disconnect('Gateway reports $TIME symbol unknown; connection has failed')
             
-            elif time_field.lower().startswith('error'):
+            elif str(time_field).lower().startswith('error'):
                 self.error_handler(self.id, 'handle_time: time field %s' % time_field)
             else:
                 year, month, day = [int(i) for i in date_field.split('-')[0:3]]
                 hour, minute, second = [int(i) for i in time_field.split(':')[0:3]]
-                self.now = self.feedzone.localize(datetime.datetime(year,month,day,hour,minute,second)).astimezone(self.localzone)
+                self.feed_now = datetime.datetime(year,month,day,hour,minute,second) + datetime.timedelta(seconds=self.time_offset)
+                self.now = self.localize_time(self.feed_now)
+		# don't add time offset
                 if minute != self.last_minute:
                     self.last_minute = minute
                     self.WriteAllClients('time: %s %s:00' % (self.now.strftime('%Y-%m-%d'), self.now.strftime('%H:%M')))
         else:
             self.error_handler(self.id, 'handle_time: unexpected null input')
+
+    def localize_time(self, feedtime):
+        """return API time corrected for local timezone"""
+        return self.feedzone.localize(feedtime).astimezone(self.localzone)
+  
+    def unlocalize_time(self, apitime):
+        """reverse localize_time to convert local timezone to API time"""
+        return self.localzone.localize(apitime).astimezone(self.feedzone)
 
     def handle_time_error(self, error):
         #time timeout error is reported as an expired callback
@@ -1161,12 +1316,13 @@ class RTX(object):
         # create callback to return to client after initial order update
         cb = API_Callback(self, tid, 'ticket', callback, self.callback_timeout['ORDER'])
         self.ticket_callbacks.append(cb)
-        self.pending_tickets[tid]=API_Order(self, tid, o, cb)
+        self.pending_tickets[tid]=API_Order(self, tid, o, 'client', cb)
         fields= ','.join(['%s=%s' %(i,v) for i,v in o.iteritems()])
 
         acb = API_Callback(self, tid, 'ticket-ack', RTX_LocalCallback(self, self.ticket_submit_ack_callback), self.callback_timeout['ORDER'])
         cb = API_Callback(self, tid, 'ticket', RTX_LocalCallback(self, self.ticket_submit_callback), self.callback_timeout['ORDER'])
         self.cxn_get('ACCOUNT_GATEWAY', 'ORDER').poke('ORDERS', '*', '', fields, acb, cb)
+        # TODO: add cb and acb to callback lists so they can be tested for timeout
 
     def ticket_submit_ack_callback(self, data):
         """called when staged order ticket request has been submitted with 'poke' and Ack has returned""" 
@@ -1195,6 +1351,7 @@ class RTX(object):
         o['DEPOSIT']=deposit
 
         o['BUYORSELL']='Buy' if quantity > 0 else 'Sell' # Buy Sell SellShort
+        o['quantity'] = quantity
         o['GOOD_UNTIL']='DAY' # DAY or YYMMDDHHMMSS
         route = self.order_route.keys()[0]
         o['EXIT_VEHICLE']=route
@@ -1250,7 +1407,7 @@ class RTX(object):
             o['CLIENT_ORDER_ID']=oid
             submission = 'Order'
             
-        o['TYPE']='UserSubmit%s%s' % (staging, submission)
+        o['TYPE'] = 'UserSubmit%s%s' % (staging, submission)
 
         # create callback to return to client after initial order update
         cb = API_Callback(self, oid, 'order', callback, self.callback_timeout['ORDER'])
@@ -1259,9 +1416,9 @@ class RTX(object):
             self.pending_orders[oid]=self.orders[oid]
             self.orders[oid].callback = cb
         else:
-            self.pending_orders[oid]=API_Order(self, oid, o, cb)
+            self.pending_orders[oid]=API_Order(self, oid, o, 'client', cb)
 
-        fields= ','.join(['%s=%s' %(i,v) for i,v in o.iteritems()])
+        fields= ','.join(['%s=%s' %(i,v) for i,v in o.iteritems() if i[0].isupper()])
 
         acb = API_Callback(self, oid, 'order-ack', RTX_LocalCallback(self, self.order_submit_ack_callback), self.callback_timeout['ORDER'])
         cb = API_Callback(self, oid, 'order', RTX_LocalCallback(self, self.order_submit_callback), self.callback_timeout['ORDER'])
@@ -1299,7 +1456,7 @@ class RTX(object):
         self.output('symbol_enable(%s,%s,%s)' % (symbol, client, callback))
         if not symbol in self.symbols.keys():
             cb = API_Callback(self, symbol, 'add-symbol', callback, self.callback_timeout['ADDSYMBOL'])
-            symbol = API_Symbol(self, symbol, client, cb)
+            API_Symbol(self, symbol, client, cb)
             self.add_symbol_callbacks.append(cb)
         else:
             self.symbols[symbol].add_client(client)
@@ -1348,9 +1505,15 @@ class RTX(object):
         cxn.request('POSITION', '*', '', cb)
         self.position_callbacks.append(cb)
 
+    def request_tickets(self, callback):
+        self._request_orders(callback, 'tickets')
+
     def request_orders(self, callback):
+        self._request_orders(callback, 'orders')
+
+    def _request_orders(self, callback, label):
         cxn = self.cxn_get('ACCOUNT_GATEWAY', 'ORDER')
-        cb = API_Callback(self, 0, 'orders', callback, self.callback_timeout['ORDERSTATUS'])
+        cb = API_Callback(self, 0, label, callback, self.callback_timeout['ORDERSTATUS'])
         cxn.request('ORDERS', '*', '', cb)
         self.openorder_callbacks.append(cb)
 
@@ -1391,20 +1554,133 @@ class RTX(object):
         data = json.loads(data)
         self.output('global cancel: %s' % repr(data))
 
-    def query_bars(self, symbol, period, bar_start, bar_end, callback):
-        self.error_handler(self.id, 'ALERT: query_bars unimplemented')
+    def _fail_query_bars(self, msg, callback):
+        self.error_handler(self.id, msg)
+        API_Callback(self, 0, 'query-bars-failed', callback).complete(None)
         return None
 
-    def handle_historical_data(self, msg):
-        for cb in self.bardata_callbacks:
-            if cb.id == msg.reqId:
-                if not cb.data:
-                    cb.data = []
-                if msg.date.startswith('finished'):
-                    cb.complete(['OK', cb.data])
-                else:
-                    cb.data.append(dict(msg.items()))
-        # self.output('historical_data: %s' % msg) #repr((id, start_date, bar_open, bar_high, bar_low, bar_close, bar_volume, count, WAP, hasGaps)))
+    def query_bars(self, symbol, interval, bar_start, bar_end, callback):
+
+        if not self.enable_barchart:
+            return self._fail_query_bars('ALERT: query_bars unimplemented', callback)
+
+        if not symbol in self.symbols:
+            return self._fail_query_bars('query_bars failed: symbol %s not active' % symbol, callback)
+
+        # intraday n-minute bars; given stop date, number of days, minutes_per_bar
+        if str(interval).startswith('D'):
+            table = 'DAILY'
+            interval = 0
+        elif str(interval).startswith('W'):
+            table = 'DAILY'
+            interval = 1
+        elif str(interval).startswith('M'):
+            table = 'DAILY'
+            interval = 2
+        else:
+            table = 'INTRADAY'
+            interval = int(interval)
+
+
+        session_start = datetime.datetime.strptime(self.symbols[symbol].rawdata['STARTTIME'], '%H:%M:%S')
+        session_stop = datetime.datetime.strptime(self.symbols[symbol].rawdata['STOPTIME'], '%H:%M:%S')
+        print('barchart session_start=%s session_stop=%s' % (session_start, session_stop))
+ 
+        # if start time is a negative integer, use it as an offset from the end time
+        # limit start and end to the session start and stop times
+        if str(bar_start).startswith('-'):
+            offset = int(str(bar_start))
+            bar_end = self.feed_now + datetime.timedelta(minutes=1)
+            if bar_end.time() > session_stop.time():
+                bar_end = datetime.datetime(bar_end.year, bar_end.month, bar_end.day, session_stop.hour, session_stop.minute, 0)
+            if table=='DAILY':
+                delta = [datetime.timedelta(days=offset), datetime.timedelta(weeks=offset), datetime.timedelta(days=offset*30)][interval]
+            else:
+                delta = datetime.timedelta(minutes=offset * interval)
+            bar_start = bar_end + delta
+            if bar_start.time() < session_start.time():
+                bar_start = datetime.datetime(bar_start.year, bar_start.month, bar_start.day, session_start.hour, session_start.minute, 0)
+            print('offset bar start: start=%s end=%s' % (repr(bar_start), repr(bar_end)))
+        else:
+            # implement defaults for bar_start, bar_end
+            if bar_start=='.':
+                bar_start = self.feed_now.date().isoformat()
+            elif re.match('^\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d$', bar_start):
+                # bar_start provided with time; adjust timezone
+                bar_start = self.unlocalize_time(datetime.datetime.strptime(bar_start, '%Y-%m-%d %H:%M:%S')).isoformat(' ')[:19]
+            elif not re.match('^\d\d\d\d-\d\d-\d\d$', bar_start):
+                return self._fail_query_bars('query_bars: bad parameter format bar_start=%s' % bar_start, callback) 
+                
+            if bar_end=='.':
+                bar_end = bar_start[:10]
+            elif re.match('^\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d$', bar_end):
+                bar_end = self.unlocalize_time(datetime.datetime.strptime(bar_end, '%Y-%m-%d %H:%M:%S')).isoformat(' ')[:19]
+            elif not re.match('^\d\d\d\d-\d\d-\d\d$', bar_end):
+                return self._fail_query_bars('query_bars: bad parameter format bar_end=%s' % bar_end, callback) 
+
+            if len(bar_start) == 10:
+                bar_start += session_start.time().strftime(' %H:%M:%S')
+
+            if len(bar_end) == 10:
+                bar_end += session_stop.time().strftime(' %H:%M:%S')
+
+            print('+++ bar_start=%s bar_end=%s' % (repr(bar_start), repr(bar_end)))
+            bar_start = datetime.datetime.strptime(bar_start, '%Y-%m-%d %H:%M:%S')
+            bar_end = datetime.datetime.strptime(bar_end, '%Y-%m-%d %H:%M:%S')
+   
+        # limit bar_start and bar_end to stay within session start, stop
+        if bar_start.time() < session_start.time() or table=='DAILY':
+            bar_start = datetime.datetime(bar_start.year, bar_start.month, bar_start.day, session_start.hour, session_start.minute, 0)
+
+        if bar_end.time() > session_stop.time() or table=='DAILY':
+            bar_end = datetime.datetime(bar_end.year, bar_end.month, bar_end.day, session_stop.hour, session_stop.minute, 0)
+
+        where = ','.join([
+	    "DISP_NAME='%s'" % symbol,
+            "BARINTERVAL=%d" % interval,
+            "STARTDATE='%s'" % bar_start.strftime('%Y/%m/%d'),
+            "CHART_STARTTIME='%s'" % bar_start.strftime('%H:%M'),
+            "STOPDATE='%s'" % bar_end.strftime('%Y/%m/%d'),
+            "CHART_STOPTIME='%s'" % bar_end.strftime('%H:%M'),
+        ])
+
+        print('barchart where=%s' % repr(where))
+
+        cb = API_Callback(self, '%s;%s' % (table, where), 'barchart', callback, self.callback_timeout['BARCHART'])
+        self.cxn_get('TA_SRV', BARCHART_TOPIC).request(table, BARCHART_FIELDS, where, cb)
+        self.bardata_callbacks.append(cb)
+
+    def format_barchart(self, rows):
+        #pprint({'format_barchart': rows})
+        bars = None 
+        if type(rows) == list and len(rows)==1:
+            row = rows[0]
+            # DAILY bars have no time values, so spoof for the parser
+            if row['TRDTIM_1']=='Error 17':
+                symbol = self.symbols[row['DISP_NAME']]
+                session_start = symbol.rawdata['STARTTIME']
+                row['TRDTIM_1'] = [session_start for t in row['TRD_DATE']]
+            types = {k:type(v) for k, v in row.iteritems()}
+            print('types = %s' % repr(types))
+            if types=={
+                'DISP_NAME': unicode,
+                'TRD_DATE': list,
+                'TRDTIM_1': list,
+                'OPEN_PRC': list,
+                'HIGH_1': list,
+                'LOW_1': list,
+                'SETTLE': list,
+                'ACVOL_1': list
+            }:
+                bars = [ self.format_barchart_date(row['TRD_DATE'][i], row['TRDTIM_1'][i]) + [row['OPEN_PRC'][i], row['HIGH_1'][i], row['LOW_1'][i], row['SETTLE'][i], row['ACVOL_1'][i]] for i in range(len(row['TRD_DATE'])) ]
+        if not bars:
+            self.error_handler(self, 'barchart data format failed: %s' % repr(rows))
+        return bars
+
+    def format_barchart_date(self, bdate, btime):
+        bartime = datetime.datetime.strptime('%s %s' % (bdate, btime), '%Y-%m-%d %H:%M:%S')
+        bartime = self.localize_time(bartime)
+        return bartime.isoformat()[:19].split('T')
 
     def query_connection_status(self):
         return self.connection_status

@@ -44,6 +44,7 @@ def requests_retry_session(
 
 class API(object):
     def __init__(self, server):
+        #sys.stderr.write('txTrader.client.API.__init__(%s, %s)\n' % (repr(self), repr(server)))
         self.server = server
         self.config = Config(server)
         self.hostname = self.config.get('HOST')
@@ -70,6 +71,7 @@ class API(object):
             'del_symbol': (self.del_symbol, True, ('symbol',)),
             'query_symbol': (self.query_symbol, True, ('symbol',)),
             'query_symbol_data': (self.query_symbol_data, True, ('symbol',)),
+            'query_symbol_bars': (self.query_symbol_bars, True, ('symbol',)),
             'query_symbols': (self.query_symbols, True, ()),
             'set_account': (self.set_account, False, ('account',)),
             'set_order_route': (self.set_order_route, True, ('route',)),
@@ -78,6 +80,7 @@ class API(object):
             'query_account': (self.query_account, True, ('account', 'fields')),
             'query_positions': (self.query_positions, True, ()),
             'query_orders': (self.query_orders, True, ()),
+            'query_tickets': (self.query_tickets, True, ()),
             'query_order': (self.query_order, True, ('order_id',)),
             'cancel_order': (self.cancel_order, True, ('order_id',)),
             'query_executions': (self.query_executions, True, ()),
@@ -174,6 +177,9 @@ class API(object):
     def query_symbol_data(self, *args):
         return self.call_txtrader_get('query_symbol_data', {'symbol': args[0]})
 
+    def query_symbol_bars(self, *args):
+        return self.call_txtrader_get('query_symbol_bars', {'symbol': args[0]})
+
     def query_accounts(self, *args):
         return self.call_txtrader_get('query_accounts', {})
 
@@ -202,6 +208,9 @@ class API(object):
 
     def query_orders(self, *args):
         return self.call_txtrader_get('query_orders', {})
+
+    def query_tickets(self, *args):
+        return self.call_txtrader_get('query_tickets', {})
 
     def query_order(self, *args):
         return self.call_txtrader_get('query_order', {'id': args[0]})

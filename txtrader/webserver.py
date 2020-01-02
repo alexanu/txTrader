@@ -81,6 +81,7 @@ class webserver(object):
         ret = {}
         ret['txtrader'] = HEADER
         ret['python'] = sys.version
+        ret['flags'] = self.api.flags()
         #ret['pip'] = check_output('pip list', shell=True)
         self.render(d, ret)
 
@@ -129,6 +130,18 @@ class webserver(object):
             ret = self.api.symbols[symbol].rawdata
         self.render(d, ret)
 
+    def json_query_symbol_bars(self, args, d):
+        """query_symbol_bars('symbol') => [[barchart data], ...]
+
+        Return array of current live bar data for given symbol
+        """
+        symbol = str(args['symbol']).upper()
+        ret = None
+        if symbol in self.api.symbols.keys():
+            api_symbol = self.api.symbols[symbol]
+            ret = api_symbol.barchart_render()
+        self.render(d, ret)
+
     def json_query_accounts(self, args, d):
         """query_accounts() => ['account_name', ...]
 
@@ -167,7 +180,7 @@ class webserver(object):
     def json_query_order(self, args, d):
         """query_order('id') => {'fieldname': data, ...}
 
-        Return dict containing order status fields for given order id
+        Return dict containing order/ticket status fields for given order id
         """
         oid = str(args['id'])
         self.api.request_order(oid, d)
@@ -178,6 +191,13 @@ class webserver(object):
         Return dict keyed by order id containing dicts of order data fields
         """
         self.api.request_orders(d)
+
+    def json_query_tickets(self, args, d):
+        """query_tickets() => {'order_id': {'field': data, ...}, ...}
+
+        Return dict keyed by order id containing dicts of staged order ticket data fields
+        """
+        self.api.request_tickets(d)
 
     def json_query_executions(self, args, d):
         """query_executions() => {'exec_id': {'field': data, ...}, ...}
@@ -241,7 +261,7 @@ class webserver(object):
         Return array containing status strings and lists of bar data if successful
         """
         symbol = str(args['symbol']).upper()
-        period = int(args['period'])
+        period = str(args['period']).upper()
         start = str(args['start'])
         end = str(args['end'])
         self.api.query_bars(symbol, period, start, end, d)

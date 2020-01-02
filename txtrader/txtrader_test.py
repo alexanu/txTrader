@@ -18,6 +18,10 @@ import time
 import simplejson as json
 from pprint import pprint
 import pytest
+import re
+import datetime
+
+FILL_TIMEOUT = 30
 
 
 TEST_ALGO_ROUTE='{"TEST-ATM-ALGO":{"STRAT_ID":"BEST","BOOKING_TYPE":"3","STRAT_TIME_TAGS":"168;126","STRAT_PARAMETERS":{"99970":"2","99867":"N","847":"BEST","90057":"BEST","91000":"4.1.95"},"ORDER_FLAGS_3":"0","ORDER_CLONE_FLAG":"1","STRAT_TARGET":"ATDL","STRATEGY_NAME":"BEST","STRAT_REDUNDANT_DATA":{"UseStartTime":"false","UseEndTime":"false","cConditionalType":"{NULL}"},"STRAT_TIME_ZONE":"America/New_York","STRAT_TYPE":"COWEN_ATM_US_EQT","STRAT_STRING_40":"BEST","UTC_OFFSET":"-240"}}'
@@ -59,14 +63,20 @@ def test_stock_prices(api):
         ('last', float, True),
         ('size', int, True),
         ('volume', int, True),
-        ('close', float, True)
+        ('open', float, True),
+        ('high', float, True),
+        ('low', float, True),
+        ('close', float, True),
+        ('vwap', float, True),
+        ('tradetime', unicode, True),
     ]
+    #('bars', list, True),
 
     for key, _type, required in tdata:
       assert key in p.keys()
       assert type(p[key]) == _type
       if required:
-        assert p[key]
+        assert not p[key] == None
 
     r = api.query_symbol_data('IBM')
     assert r
@@ -107,21 +117,23 @@ def test_buy_sell(api):
     #print('account=%s' % account)
     #api.set_account(account)
     print('buying IBM')
-    o = api.market_order('IBM', 100)
+    oid = _market_order(api, 'IBM', 100)
+    o = api.query_order(oid)
     assert o
     assert type(o) == dict
     assert 'permid' in o.keys()
+    oid = o['permid']
     assert 'status' in o.keys()
     dump('market_order(IBM,100)', o)
 
     print('selling IBM')
-
-    o = api.market_order('IBM', -100)
+    oid = _market_order(api, 'IBM', -100)
+    o = api.query_order(oid)
     assert o
     assert type(o) == dict
     assert 'permid' in o.keys()
     assert 'status' in o.keys()
-    dump('market_order(IBM,100)', o)
+    dump('market_order(IBM,-100)', o)
 
 def test_set_order_route(api):
     print()
@@ -138,7 +150,6 @@ def test_set_order_route(api):
         assert api.get_order_route() == rout
     assert api.set_order_route(oldroute) == oldroute
 
-
 def test_partial_fill(api):
     print()
     oldroute = api.get_order_route()
@@ -149,6 +160,10 @@ def test_partial_fill(api):
     print('buying %d %s' % (quantity, symbol))
     p = api.add_symbol(symbol)
     assert p
+    d = api.query_symbol_data(symbol)
+    #pprint(d)
+    now =datetime.datetime.now().strftime('%H:%M:%S')
+    during_trading_hours = bool(d['STARTTIME'] <= now <= d['STOPTIME'])
     o = api.market_order(symbol, quantity)
     assert o
     assert 'permid' in o.keys()
@@ -167,8 +182,12 @@ def test_partial_fill(api):
         if (int(filled) > 0) and (int(remaining) > 0) and (int(filled) < quantity):
             partial_fills += 1    
         average_price = o['avgfillprice'] if 'avgfillprice' in o.keys() else None
-        print('status=%s filled=%s remaining=%s average_price=%s type=%s' % (status, filled, remaining, average_price, o['TYPE']))
+        print('status=%s filled=%s remaining=%s average_price=%s type=%s' % (status, filled, remaining, average_price, o['type']))
         assert not (status=='Filled' and filled < quantity)
+        if not during_trading_hours and status == 'Error':
+            print('test verification disabled - simulated market is closed')
+            partial_fills = -1
+            break
         assert status in ['Submitted', 'Pending', 'Filled']
         time.sleep(1)
     assert partial_fills
@@ -206,6 +225,34 @@ def test_symbol_price(api):
     assert p 
     assert type(p) == dict
     assert p['symbol'] == 'AAPL'
+
+def _verify_barchart_enabled(api):
+    v = api.version()
+    assert v
+    assert type(v)==dict
+    assert type(v['flags'])==dict
+    assert 'BARCHART' in v['flags']
+    return v['flags']['BARCHART']==True
+
+def test_symbol_bars(api):
+    if 'TSLA' in api.query_symbols():
+        assert api.del_symbol('TSLA')
+    assert api.add_symbol('TSLA')
+    assert 'TSLA' in api.query_symbols()
+    bars = api.query_symbol_bars('TSLA')
+    assert type(bars) == list
+    print(repr(bars))
+    if _verify_barchart_enabled(api):
+        assert type(bars[0]) == list
+        for bar in bars:
+           print('%s' % repr(bar))
+           for i in range(len(bar)):
+               assert type(bar[i]) in [[str, unicode], [str,unicode], [float], [float], [float], [float], [int]][i]
+               assert re.match('^\d\d\d\d-\d\d-\d\d$', bar[0]) 
+               assert re.match('^\d\d:\d\d:\d\d$', bar[1]) 
+    else:
+        print('barchart disabled')
+        assert bars == []
 
 def test_query_accounts(api):
     test_account = api.account
@@ -270,6 +317,7 @@ def _wait_for_fill(api, oid, return_on_error=False):
     print('Waiting for order %s to fill...' % oid)
     done = False
     last_status = ''
+    count = 0
     while not done:
         o = api.query_order(oid)
         if last_status != o['status']:
@@ -281,6 +329,8 @@ def _wait_for_fill(api, oid, return_on_error=False):
         if o['status'] == 'Filled':
             done = True
         else:
+            count += 1
+            assert count < FILL_TIMEOUT
             time.sleep(1)
 
 def _position(api, account):
@@ -366,11 +416,11 @@ def test_staged_trade_cancel(api):
     assert type(t)==dict
     assert 'status' in t.keys()
     assert t['status'] == 'Error'
-    assert 'REASON' in t.keys()
-    assert t['REASON'].lower().startswith('user cancel')
+    assert 'REASON' in t['raw']
+    assert t['raw']['REASON'].lower().startswith('user cancel')
     print('detected user cancel of %s' % oid)
 
-@pytest.mark.staged
+#@pytest.mark.staged
 def test_staged_trade_execute(api):
     trade_symbol = 'AAPL'
     trade_quantity = 10
@@ -381,6 +431,12 @@ def test_staged_trade_execute(api):
     oid = t['permid']
     status = t['status']
     print('Created staged order %s with status %s, waiting 5 seconds, then changing order to auto-execute' % (oid, status))
+
+    tickets = api.query_tickets()
+    assert oid in tickets.keys()
+    orders = api.query_orders()
+    assert not oid in orders.keys()
+
     time.sleep(5)
     status = api.query_order(oid)['status']
     print('cancelling order %s with status=%s...' % (oid, status))
@@ -416,6 +472,9 @@ def test_trade_and_query_orders(api):
     assert type(orders[oid]) == dict
     assert orders[oid]['permid'] == oid
     assert 'status' in orders[oid]
+    tickets = api.query_tickets()
+    assert tickets != None
+    assert not oid in tickets.keys()
 
 def test_query_executions(api):
     execs = api.query_executions()
@@ -529,25 +588,30 @@ def test_trade_submission_error_bad_quantity(api):
 #        """stoplimit_order('symbol', stop_price, limit_price, quantity) => {'field':, data, ...} 
 
 @pytest.mark.bars
-def dont_test_bars(api): 
-    sbar = '2017-07-06 09:30:00' 
-    ebar = '2017-07-06 09:40:00' 
-    ret = api.query_bars('SPY', 1, sbar, ebar) 
-    assert ret 
-    assert type(ret) == list 
-    assert ret[0]=='OK' 
-    bars = ret[1] 
-    assert bars 
-    assert type(bars) == list 
-    for bar in bars:
-        assert type(bar) == dict
-        assert 'date' in bar
-        assert 'open' in bar
-        assert 'high' in bar
-        assert 'low' in bar
-        assert 'close' in bar
-        assert 'volume' in bar
-        #print('%s %s %s %s %s %s' % (bar['date'], bar['open'], bar['high'], bar['low'], bar['close'], bar['volume']))
+def test_bars(api): 
+    assert api.add_symbol('SPY')
+    sbar = '2017-08-29 09:30:00' 
+    ebar = '2017-08-29 09:40:00' 
+    bars = api.query_bars('SPY', 1, sbar, ebar) 
+    if _verify_barchart_enabled(api):
+        assert bars 
+        assert type(bars) == list 
+        for bar in bars:
+            assert type(bar) == list  
+            b_date, b_time, b_open, b_high, b_low, b_close, b_volume = bar
+            assert type(b_date) in (str, unicode) 
+            assert re.match('^\d\d\d\d-\d\d-\d\d$', b_date) 
+            assert type(b_time) in (str, unicode)
+            assert re.match('^\d\d:\d\d:\d\d$', b_time) 
+            assert type(b_open) == float
+            assert type(b_high) == float
+            assert type(b_low) == float
+            assert type(b_close) == float
+            assert type(b_volume) == int 
+            print('%s %s %.2f %.2f %.2f %.2f %d' % (b_date, b_time, b_open, b_high, b_low, b_close, b_volume))
+    else:
+        assert not bars 
+        print('bars=%s' % repr(ret))
 
 def test_cancel_order(api):
     ret = api.cancel_order('000')

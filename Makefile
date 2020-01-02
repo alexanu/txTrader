@@ -76,6 +76,14 @@ testconfig:
 	  sudo sh -c "echo $$ACCOUNT>$(ENVDIR)/TXTRADER_API_ACCOUNT";\
 	fi;
 
+cleanup:
+	@if ps ax | egrep [d]efunct; then \
+	  sudo pkill supervise;\
+	  sudo pkill multilog;\
+	  sudo kill $$(ps fax | awk '/[s]sh -v/{print $$1}');\
+	fi
+	sleep 3
+
 venv:	.make-venv
 
 .make-venv:
@@ -146,7 +154,7 @@ TPARM :=
 
 test: $(TESTS)
 	@echo Testing...
-	. $(VENV)/bin/activate && cd txtrader; envdir ../etc/txtrader env TXTRADER_TEST_MODE=$(MODE) py.test -svx $(TPARM) $(notdir $^)
+	. $(VENV)/bin/activate && cd txtrader; envdir ../etc/txtrader env TXTRADER_TEST_MODE=$(MODE) py.test -vx $(TPARM) $(notdir $^)
 
 run: 
 	@echo Running...
